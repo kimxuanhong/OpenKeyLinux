@@ -10,6 +10,7 @@
 #include <mutex>
 #include <sstream>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
@@ -232,22 +233,18 @@ private:
                          << " socket=" << socketPath_;
         }
 
-        const pid_t firstChild = fork();
-        if (firstChild < 0) {
+        // Use a single fork so the server is a real child of fcitx5.
+        // This lets us kill it cleanly when fcitx5 exits, and prevents
+        // the orphaned-daemon icon that appeared in the DE panel.
+        const pid_t child = fork();
+        if (child < 0) {
             maybeLog("fork failed");
             return false;
         }
 
-        if (firstChild == 0) {
-            const pid_t daemonChild = fork();
-            if (daemonChild < 0) {
-                _exit(127);
-            }
-            if (daemonChild > 0) {
-                _exit(0);
-            }
-
-            setsid();
+        if (child == 0) {
+            // Redirect stdio to /dev/null so the server doesn't interfere
+            // with fcitx5's own stdout/stderr.
             const int nullFd = ::open("/dev/null", O_RDWR);
             if (nullFd >= 0) {
                 dup2(nullFd, STDIN_FILENO);
@@ -263,19 +260,7 @@ private:
             _exit(127);
         }
 
-        int status = 0;
-        while (waitpid(firstChild, &status, 0) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            maybeLog("waitpid failed");
-            return false;
-        }
-
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            maybeLog("server launcher failed");
-            return false;
-        }
+        serverPid_ = child;
         return true;
     }
 
@@ -318,6 +303,18 @@ private:
         }
         if (readerThread_.joinable()) {
             readerThread_.join();
+        }
+        // Terminate the server child process if we spawned it.
+        if (serverPid_ > 0) {
+            ::kill(serverPid_, SIGTERM);
+            // Reap the child to avoid a zombie process.
+            int status = 0;
+            while (waitpid(serverPid_, &status, 0) < 0) {
+                if (errno != EINTR) {
+                    break;
+                }
+            }
+            serverPid_ = -1;
         }
     }
 
@@ -403,6 +400,7 @@ private:
     int fd_ = -1;
     bool stop_ = false;
     bool startAttempted_ = false;
+    pid_t serverPid_ = -1;
     std::thread readerThread_;
     std::unordered_map<uint64_t,
                        fcitx::TrackableObjectReference<fcitx::InputContext>>
@@ -668,8 +666,10 @@ static bool isElectronLikeProgram(const std::string &program) {
 
 static bool shouldSkipDSTOnWayland(fcitx::InputContext *ic,
                                    const std::string &program) {
-    return !isRunningOnX11(ic) &&
-           (isBrowserLikeProgram(program) || isElectronLikeProgram(program));
+    // Returning false allows deleteSurroundingText to be used in Wayland browsers,
+    // which prevents the "URL bar auto-suggestion selection" bug where a physical
+    // backspace deletes the suggestion instead of the typed character.
+    return false;
 }
 
 static bool shouldUseDST(fcitx::InputContext *ic, const std::string &program,
@@ -1385,9 +1385,17 @@ public:
                 return true;
             }
 
+            unsigned int actualDeleteCount = deleteCount;
+            if (ic) {
+                const auto &st = ic->surroundingText();
+                if (st.isValid() && st.cursor() != st.anchor()) {
+                    actualDeleteCount += 1;
+                }
+            }
+
             const std::string programForInjector = state.program;
             const auto method = deps_.backspaceInjector->sendBackspaces(
-                ic, programForInjector, static_cast<int>(deleteCount), debug,
+                ic, programForInjector, static_cast<int>(actualDeleteCount), debug,
                 timing.interKeyUsec);
 
             if (method == BackspaceInjector::Method::DeleteSurroundingText) {
@@ -1409,7 +1417,7 @@ public:
                 deltaState.rewriteLock = true;
                 deltaState.waitingBackspaceAck = true;
                 deltaState.expectedBackspaces =
-                    static_cast<int>(deleteCount) + 1;
+                    static_cast<int>(actualDeleteCount) + 1;
                 deltaState.seenBackspaces = 0;
                 deltaState.pendingConvertedText = std::move(commitText);
                 deltaState.pendingShownTextAfterCommit = newWord;
@@ -1568,10 +1576,12 @@ public:
             return true;
         }
 
-        nonPreeditState.nonPreeditKeys.push_back(key);
-        event.filterAndAccept();
-        pumpNonPreedit(ic, state, adapterShared, debug);
-        return true;
+        const bool handled = processNonPreeditKey(ic, state, key, adapterShared, debug);
+        if (handled) {
+            event.filterAndAccept();
+            return true;
+        }
+        return false;
     }
 
     void handleRemoteBackspaceAction(fcitx::InputContext *ic,
@@ -1711,16 +1721,24 @@ private:
 
         if (deps_.nonPreeditRemoteEnabled && deps_.nonPreeditRemoteEnabled() &&
             deps_.nonPreeditRemoteSchedule) {
+            unsigned int uinputDeleteCount = deleteCount;
+            if (ic) {
+                const auto &st = ic->surroundingText();
+                if (st.isValid() && st.cursor() != st.anchor()) {
+                    uinputDeleteCount += 1;
+                }
+            }
+
             nonPreeditState.rewriteLock = true;
             nonPreeditState.waitingBackspaceAck = false;
-            nonPreeditState.expectedBackspaces = static_cast<int>(deleteCount);
+            nonPreeditState.expectedBackspaces = static_cast<int>(uinputDeleteCount);
             nonPreeditState.seenBackspaces = 0;
             nonPreeditState.pendingConvertedText = commitText;
             nonPreeditState.pendingShownTextAfterCommit = newWord;
             nonPreeditState.hasRewrittenCurrentWord =
                 nonPreeditState.hasRewrittenCurrentWord || (newWord != rawAppend);
             if (deps_.nonPreeditRemoteSchedule(
-                    ic, state, deleteCount, timing.interKeyUsec,
+                    ic, state, uinputDeleteCount, timing.interKeyUsec,
                     timing.commitDelayUsec)) {
                 nonPreeditState.remoteRewritePending = true;
                 return true;
